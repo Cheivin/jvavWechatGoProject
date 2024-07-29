@@ -1,4 +1,4 @@
-package ws
+package redirect
 
 import (
 	"context"
@@ -6,36 +6,35 @@ import (
 	"github.com/gorilla/websocket"
 	"log/slog"
 	"time"
-	"wechat-hub/hub"
 )
 
-type Client interface {
+type wsConnection interface {
 	Serve(ctx context.Context) error
 	Close()
 	SendMessage(message []byte) error
 }
 
-type client struct {
+type connection struct {
 	*websocket.Conn
 	heartbeat         time.Duration
 	messageBufferPool chan []byte
 	exit              chan error
 	cancelFn          context.CancelFunc
-	onMessage         hub.OnMessage
+	receiveMessage    func(messageType int, message []byte)
 }
 
-func newClient(conn *websocket.Conn, heartbeat time.Duration, onMessage hub.OnMessage) Client {
+func newClient(conn *websocket.Conn, heartbeat time.Duration, receiveMessage func(messageType int, message []byte)) wsConnection {
 	conn.SetReadLimit(1024 * 1024 * 10)
-	return &client{
+	return &connection{
 		Conn:              conn,
 		heartbeat:         heartbeat,
 		messageBufferPool: make(chan []byte, 5),
 		exit:              make(chan error),
-		onMessage:         onMessage,
+		receiveMessage:    receiveMessage,
 	}
 }
 
-func (c *client) Serve(ctx context.Context) error {
+func (c *connection) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancelFn = cancel
 	var ticker *time.Ticker
@@ -50,7 +49,7 @@ func (c *client) Serve(ctx context.Context) error {
 		close(c.messageBufferPool)
 		_ = c.Conn.Close()
 	}()
-	go c.receiveMessage()
+	go c.readMessage()
 	go c.sendMessage()
 	for {
 		select {
@@ -66,14 +65,14 @@ func (c *client) Serve(ctx context.Context) error {
 		}
 	}
 }
-func (c *client) Close() {
+func (c *connection) Close() {
 	if c.cancelFn != nil {
 		c.cancelFn()
 	} else {
 		_ = c.Conn.Close()
 	}
 }
-func (c *client) SendMessage(message []byte) (err error) {
+func (c *connection) SendMessage(message []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
@@ -83,7 +82,7 @@ func (c *client) SendMessage(message []byte) (err error) {
 	return nil
 }
 
-func (c *client) receiveMessage() {
+func (c *connection) readMessage() {
 	for {
 		messageType, message, err := c.ReadMessage()
 		if err != nil {
@@ -105,21 +104,21 @@ func (c *client) receiveMessage() {
 	}
 }
 
-func (c *client) onReceiveMessage(messageType int, message []byte) {
+func (c *connection) onReceiveMessage(messageType int, message []byte) {
 	defer func() {
 		if e := recover(); e != nil {
 			slog.Error("onMessage出错", "error", e)
 		}
 	}()
-	if c.onMessage != nil {
-		c.onMessage(message)
+	if c.receiveMessage != nil {
+		c.receiveMessage(messageType, message)
 	} else {
 		slog.Info("收到消息", "messageType", messageType, "message", string(message))
 	}
 }
 
 // sendMessage 将缓冲队列中的信息转发到服务器
-func (c *client) sendMessage() {
+func (c *connection) sendMessage() {
 	for {
 		message := <-c.messageBufferPool
 		err := c.WriteMessage(websocket.TextMessage, message)

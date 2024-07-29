@@ -8,6 +8,7 @@ import (
 )
 
 type Storage interface {
+	Reader(filename string) (io.ReadCloser, error)
 	Writer(filename string) (io.WriteCloser, string, error)
 }
 
@@ -24,6 +25,9 @@ func NewLocalStorage(dataDir string) *LocalStorage {
 	}
 }
 
+func (s LocalStorage) Reader(filename string) (io.ReadCloser, error) {
+	return os.Open(filepath.Join(s.DataDir, filename))
+}
 func (s LocalStorage) Writer(filename string) (io.WriteCloser, string, error) {
 	filename = filepath.Join(time.Now().Format("2006/01/02"), filename)
 	savePath := filepath.Join(s.DataDir, filename)

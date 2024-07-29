@@ -4,74 +4,129 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"github.com/eatmoreapple/openwechat"
-	"log"
+	"github.com/robfig/cron/v3"
+	"golang.org/x/time/rate"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
-	"wechat-hub/db"
+	authManager "wechat-hub/auth"
 	"wechat-hub/hub"
+	"wechat-hub/redirect"
 	"wechat-hub/storage"
-	"wechat-hub/ws"
 )
 
 type Hub struct {
-	db        db.Storage
-	storage   storage.Storage
-	redirects []hub.MessageRedirect
-	member    *hub.MemberManager
 	ctx       context.Context
+	member    hub.MemberManager
+	message   hub.MessageManager
+	storage   storage.Storage
+	sender    *MsgSender
+	auth      *authManager.Manager
+	limit     *rate.Limiter
+	redirects []redirect.MessageRedirector
 }
 
-func NewHub(ctx context.Context, db db.Storage, storage storage.Storage) *Hub {
-	member := hub.NewIDStorage(db)
+func NewHub(ctx context.Context, member hub.MemberManager, message hub.MessageManager, storage storage.Storage, auth *authManager.Manager) *Hub {
 	return &Hub{
-		db:        db,
-		storage:   storage,
-		redirects: []hub.MessageRedirect{},
-		member:    member,
 		ctx:       ctx,
+		member:    member,
+		message:   message,
+		storage:   storage,
+		auth:      auth,
+		limit:     rate.NewLimiter(rate.Every(10*time.Second), 1),
+		redirects: []redirect.MessageRedirector{},
 	}
 }
 
+func (h *Hub) SetMessageSender(sender *MsgSender) {
+	h.sender = sender
+}
+
 // AddRedirect 添加一个转发器
-func (h *Hub) AddRedirect(redirect hub.MessageRedirect) {
+func (h *Hub) AddRedirect(redirect redirect.MessageRedirector) {
 	h.redirects = append(h.redirects, redirect)
 }
 
 // UseWebsocketClientRedirect 使用websocket客户端转发
 func (h *Hub) UseWebsocketClientRedirect(serverUrl string, heartbeat time.Duration) {
-	h.AddRedirect(ws.NewWebsocketClientMessageHandler(h.ctx, serverUrl, heartbeat, h.receive))
+	h.AddRedirect(redirect.NewWebsocketClientMessageHandler(h.ctx, serverUrl, redirect.WSClientHeartbeat(heartbeat)))
 }
 
 // UseWebsocketServerRedirect 使用websocket服务端转发
-func (h *Hub) UseWebsocketServerRedirect(heartbeat time.Duration) *ws.ServerMessageHandler {
-	server := ws.NewWebsocketServerMessageHandler(h.ctx, heartbeat, h.receive)
+func (h *Hub) UseWebsocketServerRedirect(port int, heartbeat time.Duration) {
+	server := redirect.NewWebsocketServerMessageHandler(h.ctx, redirect.WSServerHeartbeat(heartbeat), redirect.WSServerAuth(h.auth))
+	server.OnMessage(h.receive)
+	go server.ListenAndServe(port)
 	h.AddRedirect(server)
-	return server
 }
 
+func (h *Hub) UseMQTTServerRedirect(cacheDir string, tcpPort int, wsPort int) {
+	options := []redirect.MQTTOption{
+		redirect.WithSubscribeTopic("command"), redirect.WithMQTTAuth(h.auth),
+		redirect.WithTCP(tcpPort),
+	}
+	if wsPort > 0 {
+		options = append(options, redirect.WithWS(wsPort))
+	}
+	server := redirect.NewMQTTServerMessageHandler(cacheDir, "message", options...)
+	server.OnMessage(h.receive)
+	go server.ListenAndServe()
+	h.AddRedirect(server)
+}
+
+// dispatch 用于将组装好的消息下发给转发器
 func (h *Hub) dispatch(message hub.Message) {
+	// 消息id不为空的才需要保存
+	if message.ID() != "" {
+		if err := h.message.Save(message); err != nil {
+			slog.Error("消息保存失败", "msgId", message.ID(), "err", err)
+		}
+	}
 	marshal, err := message.Marshal()
 	if err != nil {
 		slog.Error("消息序列化失败", "msgId", message.ID(), "err", err)
 		return
 	}
-	for _, redirect := range h.redirects {
-		go func(redirect hub.MessageRedirect) {
-			if err := redirect.RedirectBytes(marshal); err != nil {
+	for _, r := range h.redirects {
+		go func(redirect redirect.MessageRedirector) {
+			if err := redirect.SendMessage(marshal); err != nil {
 				slog.Error("消息转发失败", "msgId", message.ID(), "err", err)
 			}
-		}(redirect)
+		}(r)
 	}
 }
 
-func (h *Hub) receive(message []byte) {
-	slog.Debug("收到上报消息", "msgId", string(message))
+// 接受转发器上报的消息
+func (h *Hub) receive(message []byte) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			slog.Error("处理上报消息出错", "Error", e)
+			err = fmt.Errorf("panic: %v", e)
+		}
+	}()
+	if h.sender == nil {
+		slog.Debug("收到上报消息", "message", string(message))
+		return
+	}
+	command := &hub.Command{}
+	if err = json.Unmarshal(message, command); err != nil {
+		slog.Error("命令消息解析失败", "message", string(message), "err", err)
+		return
+	}
+	if command.Command != "sendMessage" {
+		slog.Error("不支持的命令", "command", command.Command, "param", command.Param)
+		return
+	}
+	err = h.sender.SendMsg(&command.Param)
+	if err != nil {
+		slog.Error("消息发送失败", "err", err)
+	}
+	return
 }
 
 // Register 注册消息监听器
@@ -89,18 +144,15 @@ func (h *Hub) messageFilter() (matchFunc openwechat.MatchFunc, handlers openwech
 			if ctx.IsNotify() || ctx.IsSendBySelf() {
 				ctx.Abort()
 			}
-			if !h.db.PutIfAbsent(ctx.MsgId, ctx.MsgId) {
+			if exist, _ := h.message.Exist(ctx.MsgId); exist {
 				slog.Warn("消息重复", "msgId", ctx.MsgId, "msgType", ctx.MsgType)
 				ctx.Abort()
 			}
 		}
 }
 
-func (h *Hub) newMessage(ctx *openwechat.MessageContext) *hub.BaseMessage {
-	gid := ""
-	groupName := ""
-	uid := ""
-	username := ""
+func (h *Hub) prepareMessage(ctx *openwechat.MessageContext) *hub.BaseMessage {
+	var gid, groupName, uid, username string
 	if ctx.IsSendByGroup() {
 		g, _ := ctx.Sender()
 		if id, err := h.member.GetID(g); err != nil {
@@ -129,43 +181,195 @@ func (h *Hub) newMessage(ctx *openwechat.MessageContext) *hub.BaseMessage {
 		}
 	}
 	return &hub.BaseMessage{
-		MsgType:    int(ctx.MsgType),
-		Time:       ctx.CreateTime,
-		MsgID:      ctx.MsgId,
-		GID:        gid,
-		GroupName:  groupName,
-		UID:        uid,
-		Username:   username,
-		RawMessage: ctx.Content,
+		MsgType:   int(ctx.MsgType),
+		Time:      ctx.CreateTime,
+		MsgID:     ctx.MsgId,
+		GID:       gid,
+		GroupName: groupName,
+		UID:       uid,
+		Username:  username,
+	}
+}
+
+func (h *Hub) prepareSystemMessage(ctx *openwechat.MessageContext) *hub.SystemMessage {
+	var gid, groupName, uid, username string
+	if ctx.IsSendByGroup() {
+		g, _ := ctx.Sender()
+		if id, err := h.member.GetID(g); err != nil {
+			slog.Error("获取群组ID失败", "msgId", ctx.MsgId, "err", err)
+			return nil
+		} else {
+			groupName = g.NickName
+			gid = id
+		}
+	} else {
+		u, _ := ctx.Sender()
+		if id, err := h.member.GetID(u); err != nil {
+			slog.Error("获取用户ID失败", "msgId", ctx.MsgId, "err", err)
+			return nil
+		} else {
+			uid = id
+			username = u.NickName
+		}
+	}
+	return &hub.SystemMessage{
+		BaseMessage: hub.BaseMessage{
+			MsgType:   int(openwechat.MsgTypeSys),
+			Time:      ctx.CreateTime,
+			MsgID:     ctx.MsgId,
+			GID:       gid,
+			GroupName: groupName,
+			UID:       uid,
+			Username:  username,
+		},
 	}
 }
 
 // onSystemMessage 系统消息解析
 func (h *Hub) onSystemMessage(ctx *openwechat.MessageContext) {
-	if ctx.IsRenameGroup() {
+	if !ctx.IsSystem() {
+		return
+	}
+	if username, groupName, ok := isRenameGroup(ctx.Content); ok {
 		defer ctx.Abort()
-		matches := regexp.MustCompile(`"(.*?)"修改群名为“(.*?)”`).FindAllString(ctx.Content, -1)
-		if len(matches) > 0 {
-			parts := strings.SplitN(matches[0], "修改群名为", 2)
-			userName := strings.Trim(parts[0], `"`)
-			groupName := strings.TrimPrefix(strings.TrimSuffix(parts[1], `”`), `“`)
-			slog.Info("检测到群名片已修改", "user", userName, "groupName", groupName)
+
+		sender, _ := ctx.Sender()
+		event := &hub.EventRenameGroup{
+			Name:      username,
+			GroupName: groupName,
+		}
+		user := sender.MemberList.Search(1, searchByName(username))
+		if user != nil && user.First() != nil {
+			id, err := h.member.GetID(user.First())
+			if err != nil {
+				slog.Error("获取用户ID失败", "msgId", ctx.MsgId, "err", err)
+			} else {
+				event.UID = id
+			}
+		}
+		slog.Info("检测到群名修改", "user", username, "groupName", groupName)
+		h.member.RefreshGroupMember()
+		message := h.prepareSystemMessage(ctx)
+		message.Event = "RenameGroup"
+		message.Data = event
+		h.dispatch(message)
+		// 设置为已读
+		if h.limit.Allow() {
 			_ = ctx.AsRead()
-			return
 		}
 	}
+
 }
 
 // onText 转发文字消息
 func (h *Hub) onText(ctx *openwechat.MessageContext) {
-	message := h.newMessage(ctx)
+	defer ctx.Abort()
+	message := h.prepareMessage(ctx)
 	if message == nil {
 		return
 	}
-	// TODO 解析引用消息部分
-	// TODO 解析AT消息部分
 
-	h.dispatch(message)
+	msgContent := strings.TrimSpace(openwechat.FormatEmoji(ctx.Content))
+
+	var quote *hub.Quote
+	var at *hub.At
+	if ctx.IsSendByGroup() {
+		sender, _ := ctx.Sender()
+
+		// 解析引用消息部分
+		if quoteContent, pureContent, separator, ok := getQuote(msgContent); ok {
+			msgContent = pureContent
+
+			username, user := getUserFromContent[openwechat.Members](quoteContent, separator, func(name string) (openwechat.Members, bool) {
+				searched := sender.MemberList.Search(1, searchByName(name))
+				return searched, searched != nil && searched.First() != nil
+			})
+			if user != nil && user.First() != nil && username != "" {
+				id, err := h.member.GetID(user.First())
+				if err != nil {
+					slog.Error("获取用户ID失败", "msgId", ctx.MsgId, "err", err)
+				} else {
+					quoteContent = strings.TrimPrefix(quoteContent, username+separator)
+					quote = &hub.Quote{
+						UID:     id,
+						Name:    username,
+						Bot:     user.First().UserName == ctx.Owner().UserName,
+						Content: quoteContent,
+					}
+				}
+			}
+		}
+
+		// 解析AT消息部分
+		var atName string
+		var receiver openwechat.Members
+
+		if ctx.IsAt() { // 是否AT机器人的
+			receiver = sender.MemberList.SearchByUserName(1, ctx.ToUserName)
+			if receiver != nil {
+				displayName := receiver.First().DisplayName
+				if displayName == "" {
+					displayName = receiver.First().NickName
+				}
+				atName = openwechat.FormatEmoji(displayName)
+			}
+		} else if strings.Contains(msgContent, "@") { // 是否AT其他人的
+			atPos := strings.Index(msgContent, "@")
+			u2005Pos := strings.Index(msgContent[atPos:], "\u2005")
+			if u2005Pos >= 0 { // 取特殊标记中间部分
+				atName = strings.TrimSpace(msgContent[atPos+1 : atPos+u2005Pos])
+				receiver = sender.MemberList.Search(1, searchByName(atName))
+			} else {
+				atName, receiver = getUserFromContent[openwechat.Members](msgContent[atPos+1:], " ", func(name string) (openwechat.Members, bool) {
+					searched := sender.MemberList.Search(1, searchByName(name))
+					return searched, searched != nil && searched.First() != nil
+				})
+			}
+		}
+		if receiver != nil && receiver.First() != nil && atName != "" {
+			if strings.Contains(msgContent, "\u2005") {
+				msgContent = strings.Replace(msgContent, "\u2005", "", 1)
+			}
+			offset := -1
+			length := 0
+			flags := []string{"@" + atName + " ", "@" + atName}
+			for _, flag := range flags {
+				offset = strings.Index(msgContent, flag)
+				if offset != -1 {
+					offset = len([]rune(msgContent[:offset]))
+					length = len([]rune(flag))
+					break
+				}
+			}
+			id, err := h.member.GetID(receiver.First())
+			if err != nil {
+				slog.Error("获取用户ID失败", "msgId", ctx.MsgId, "err", err)
+			} else {
+				at = &hub.At{
+					UID:    id,
+					Name:   atName,
+					Bot:    receiver.First().UserName == ctx.Owner().UserName,
+					Offset: offset,
+					Length: length,
+				}
+			}
+		}
+	}
+	if at == nil {
+		slog.Info("收到文本消息", "msgId", ctx.MsgId, "content", ctx.Content)
+	} else {
+		slog.Info("收到文本消息", "msgId", ctx.MsgId, "content", ctx.Content, "at", *at)
+	}
+	h.dispatch(&hub.TextMessage{
+		BaseMessage: *message,
+		Content:     msgContent,
+		Quote:       quote,
+		At:          at,
+	})
+	// 设置为已读
+	if h.limit.Allow() {
+		_ = ctx.AsRead()
+	}
 }
 
 // onRecalled 转发消息撤回消息
@@ -176,7 +380,7 @@ func (h *Hub) onRecalled(ctx *openwechat.MessageContext) {
 		slog.Error("解析撤回消息失败", "msgId", ctx.MsgId, "err", err)
 		return
 	}
-	message := h.newMessage(ctx)
+	message := h.prepareMessage(ctx)
 	if message == nil {
 		return
 	}
@@ -187,6 +391,10 @@ func (h *Hub) onRecalled(ctx *openwechat.MessageContext) {
 			ReplaceMsg: recalled.RevokeMsg.ReplaceMsg,
 		},
 	})
+	// 设置为已读
+	if h.limit.Allow() {
+		_ = ctx.AsRead()
+	}
 }
 
 // onMedia 转发文件消息
@@ -195,11 +403,6 @@ func (h *Hub) onMedia(ctx *openwechat.MessageContext) {
 		return
 	}
 	defer ctx.Abort()
-
-	message := h.newMessage(ctx)
-	if message == nil {
-		return
-	}
 
 	var buf bytes.Buffer
 	filename := ctx.FileName
@@ -212,7 +415,7 @@ func (h *Hub) onMedia(ctx *openwechat.MessageContext) {
 			fileExt = ".mp3"
 		} else if ctx.IsPicture() || ctx.IsEmoticon() {
 			if err := ctx.SaveFile(&buf); err != nil {
-				log.Println("获取文件失败", err)
+				slog.Error("获取文件失败", "filename", filename, err)
 				ctx.Content = strings.TrimSpace(filename)
 				return
 			}
@@ -245,6 +448,11 @@ func (h *Hub) onMedia(ctx *openwechat.MessageContext) {
 			return
 		}
 	}
+
+	message := h.prepareMessage(ctx)
+	if message == nil {
+		return
+	}
 	h.dispatch(&hub.MediaMessage{
 		BaseMessage: *message,
 		Media: hub.Media{
@@ -253,4 +461,51 @@ func (h *Hub) onMedia(ctx *openwechat.MessageContext) {
 			Size:     ctx.FileSize,
 		},
 	})
+	// 设置为已读
+	if h.limit.Allow() {
+		_ = ctx.AsRead()
+	}
+}
+
+func (h *Hub) StartWatchMembers() {
+	c := cron.New(cron.WithSeconds(), cron.WithLogger(cron.DefaultLogger))
+	for _, spec := range []string{"0 0/5 6-23 * * *", "0 0/30 0-6 * * *"} {
+		_, err := c.AddFunc(spec, h.watchMembersAndNotify)
+		if err != nil {
+			slog.Error("添加定时任务出错", "cron", spec, "error", err)
+		}
+	}
+	slog.Info("开始监听群成员变动")
+	c.Start()
+}
+
+func (h *Hub) watchMembersAndNotify() {
+	exitGroupUserMap := h.member.RefreshGroupMember()
+	if len(exitGroupUserMap) == 0 {
+		return
+	}
+
+	for gid, users := range exitGroupUserMap {
+		groupName, _ := h.member.GetName(gid)
+
+		exits := make([]hub.EventExitGroupUser, 0, len(users))
+		for _, user := range users {
+			exits = append(exits, hub.EventExitGroupUser{
+				UID:  user.UID,
+				Name: user.Nickname,
+			})
+		}
+
+		// 下发系统消息
+		h.dispatch(&hub.SystemMessage{
+			BaseMessage: hub.BaseMessage{
+				MsgType:   int(openwechat.MsgTypeSys),
+				Time:      time.Now().Unix(),
+				GID:       gid,
+				GroupName: groupName,
+			},
+			Event: "ExitGroup",
+			Data:  exits,
+		})
+	}
 }

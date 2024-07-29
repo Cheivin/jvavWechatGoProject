@@ -1,37 +1,44 @@
-package ws
+package redirect
 
 import (
 	"context"
 	"github.com/gorilla/websocket"
 	"log/slog"
 	"time"
-	"wechat-hub/hub"
 )
 
-type ClientMessageHandler struct {
+type WSClientRedirector struct {
 	serverUrl string
 	messages  chan []byte
 	heartbeat time.Duration
-	server    Client
-	onMessage hub.OnMessage
+	server    wsConnection
+	onMessage OnMessage
 }
 
-func NewWebsocketClientMessageHandler(ctx context.Context, serverUrl string, heartbeat time.Duration, onMessage hub.OnMessage) *ClientMessageHandler {
-	h := &ClientMessageHandler{
-		serverUrl: serverUrl,
-		heartbeat: heartbeat,
-		messages:  make(chan []byte, 10),
-		onMessage: onMessage,
+type WSClientOption func(h *WSClientRedirector)
+
+func WSClientHeartbeat(heartbeat time.Duration) WSClientOption {
+	return func(h *WSClientRedirector) {
+		// 最低5s心跳
+		if heartbeat < time.Second*5 {
+			heartbeat = time.Second * 5
+		}
+		h.heartbeat = heartbeat
 	}
-	// 最低5s心跳
-	if h.heartbeat > 0 && h.heartbeat < time.Second*5 {
-		h.heartbeat = time.Second * 5
+}
+func NewWebsocketClientMessageHandler(ctx context.Context, serverUrl string, options ...WSClientOption) *WSClientRedirector {
+	h := &WSClientRedirector{
+		serverUrl: serverUrl,
+		messages:  make(chan []byte, 10),
+	}
+	for _, option := range options {
+		option(h)
 	}
 	go h.serve(ctx)
 	return h
 }
 
-func (h *ClientMessageHandler) serve(ctx context.Context) {
+func (h *WSClientRedirector) serve(ctx context.Context) {
 	for {
 		conn, _, err := websocket.DefaultDialer.Dial(h.serverUrl, nil)
 		if err != nil {
@@ -41,7 +48,11 @@ func (h *ClientMessageHandler) serve(ctx context.Context) {
 		}
 		slog.Info("websocket连接成功", "server", h.serverUrl)
 		// 创建client
-		c := newClient(conn, h.heartbeat, h.onMessage)
+		c := newClient(conn, h.heartbeat, func(messageType int, message []byte) {
+			if h.onMessage != nil {
+				_ = h.onMessage(message)
+			}
+		})
 		h.server = c
 		go h.sendMessage()
 		if err := c.Serve(ctx); err == nil {
@@ -52,7 +63,7 @@ func (h *ClientMessageHandler) serve(ctx context.Context) {
 	}
 }
 
-func (h *ClientMessageHandler) sendMessage() {
+func (h *WSClientRedirector) sendMessage() {
 	for message := range h.messages {
 		if err := h.server.SendMessage(message); err != nil {
 			slog.Error("发送消息失败", "err", err)
@@ -61,15 +72,11 @@ func (h *ClientMessageHandler) sendMessage() {
 	}
 }
 
-func (h *ClientMessageHandler) Redirect(message hub.Message) error {
-	bytes, err := message.Marshal()
-	if err != nil {
-		return err
-	}
-	return h.RedirectBytes(bytes)
-}
-
-func (h *ClientMessageHandler) RedirectBytes(bytes []byte) error {
+func (h *WSClientRedirector) SendMessage(bytes []byte) error {
 	h.messages <- bytes
 	return nil
+}
+
+func (h *WSClientRedirector) OnMessage(fn OnMessage) {
+	h.onMessage = fn
 }
