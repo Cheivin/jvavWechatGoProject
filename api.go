@@ -70,6 +70,7 @@ func NewHttpHandler(storage storage.Storage, member hub.MemberManager, sender *M
 	for _, option := range options {
 		option(h)
 	}
+	h.HandleFunc("/health", h.health)
 	h.HandleFunc("/upload", h.upload)
 	h.HandleFunc("/resource", h.resource)
 	h.HandleFunc("/msg/send", h.sendMsg)
@@ -122,6 +123,16 @@ func (h *HttpHandler) checkAuth(r *http.Request) bool {
 		return h.auth.CheckUser(username, password)
 	}
 	return true
+}
+
+func (h *HttpHandler) health(w http.ResponseWriter, r *http.Request) {
+	if h.sender.Bot.Alive() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UP"))
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("DOWN"))
+	}
 }
 
 // 上传资源
