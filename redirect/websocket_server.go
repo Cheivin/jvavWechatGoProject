@@ -103,8 +103,8 @@ func (h *WSServerRedirector) Register(dispatcher *openwechat.MessageMatchDispatc
 }
 
 func (h *WSServerRedirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("username")
 	if h.auth != nil {
-		username := r.URL.Query().Get("username")
 		password := r.URL.Query().Get("password")
 		if !h.auth.CheckUser(username, password) {
 			slog.Error("WebsocketServerMessageHandler Auth 用户名或密码错误")
@@ -120,7 +120,7 @@ func (h *WSServerRedirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.register <- newClient(conn, h.heartbeat, func(messageType int, message []byte) {
 		if h.onMessage != nil {
-			_ = h.onMessage(message)
+			_ = h.onMessage(message, "WS_SERVER", username)
 		}
 	})
 }

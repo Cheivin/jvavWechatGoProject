@@ -7,4 +7,4 @@ type MessageRedirector interface {
 type MessageReceiver interface {
 	OnMessage(OnMessage)
 }
-type OnMessage func([]byte) error
+type OnMessage func(payload []byte, receiver string, id string) error

@@ -76,7 +76,7 @@ func (h *MQTTRedirector) ListenAndServe() {
 	if h.subscribeTopic != "" {
 		if err := h.server.Subscribe(h.subscribeTopic, 1, func(cl *mqtt.Client, sub packets.Subscription, pk packets.Packet) {
 			if h.onMessage != nil {
-				_ = h.onMessage(pk.Payload)
+				_ = h.onMessage(pk.Payload, "MQTT", string(cl.Properties.Username))
 			}
 		}); err != nil {
 			panic(err)

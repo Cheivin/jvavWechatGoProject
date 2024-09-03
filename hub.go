@@ -102,29 +102,29 @@ func (h *Hub) dispatch(message hub.Message) {
 }
 
 // 接受转发器上报的消息
-func (h *Hub) receive(message []byte) (err error) {
+func (h *Hub) receive(message []byte, from string, id string) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
-			slog.Error("处理上报消息出错", "Error", e)
+			slog.Error("处理上报消息出错", "receiver", from, "id", id, "Error", e)
 			err = fmt.Errorf("panic: %v", e)
 		}
 	}()
 	if h.sender == nil {
-		slog.Debug("收到上报消息", "message", string(message))
+		slog.Debug("收到上报消息", "message", string(message), "receiver", from, "id", id)
 		return
 	}
 	command := &hub.Command{}
 	if err = json.Unmarshal(message, command); err != nil {
-		slog.Error("命令消息解析失败", "message", string(message), "err", err)
+		slog.Error("命令消息解析失败", "message", string(message), "receiver", from, "id", id, "err", err)
 		return
 	}
 	if command.Command != "sendMessage" {
-		slog.Error("不支持的命令", "command", command.Command, "param", command.Param)
+		slog.Error("不支持的命令", "command", command.Command, "param", command.Param, "receiver", from, "id", id)
 		return
 	}
 	err = h.sender.SendMsg(&command.Param)
 	if err != nil {
-		slog.Error("消息发送失败", "err", err)
+		slog.Error("消息发送失败", "receiver", from, "id", id, "err", err)
 	}
 	return
 }

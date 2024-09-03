@@ -50,7 +50,7 @@ func (h *WSClientRedirector) serve(ctx context.Context) {
 		// 创建client
 		c := newClient(conn, h.heartbeat, func(messageType int, message []byte) {
 			if h.onMessage != nil {
-				_ = h.onMessage(message)
+				_ = h.onMessage(message, "WS_CLIENT", h.serverUrl)
 			}
 		})
 		h.server = c
