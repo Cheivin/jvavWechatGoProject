@@ -3,7 +3,7 @@ module wechat-hub
 go 1.22.4
 
 require (
-	github.com/eatmoreapple/openwechat v1.4.7
+	github.com/eatmoreapple/openwechat v1.4.8
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-resty/resty/v2 v2.13.1
 	github.com/gorilla/websocket v1.5.3
