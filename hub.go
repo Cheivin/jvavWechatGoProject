@@ -415,7 +415,7 @@ func (h *Hub) onMedia(ctx *openwechat.MessageContext) {
 			fileExt = ".mp3"
 		} else if ctx.IsPicture() || ctx.IsEmoticon() {
 			if err := ctx.SaveFile(&buf); err != nil {
-				slog.Error("获取文件失败", "filename", filename, err)
+				slog.Error("获取文件失败", "filename", filename, "err", err)
 				ctx.Content = strings.TrimSpace(filename)
 				return
 			}

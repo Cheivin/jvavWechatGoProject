@@ -4,12 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/eatmoreapple/openwechat"
-	"github.com/glebarez/sqlite"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
-	"gorm.io/gorm/schema"
 	"log"
 	"log/slog"
 	"os"
@@ -20,6 +14,13 @@ import (
 	"wechat-hub/auth"
 	"wechat-hub/hub"
 	"wechat-hub/storage"
+
+	"github.com/eatmoreapple/openwechat"
+	"github.com/glebarez/sqlite"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 var (

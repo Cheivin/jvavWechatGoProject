@@ -3,13 +3,13 @@ package redirect
 import (
 	"bytes"
 	"fmt"
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
-	"github.com/mochi-mqtt/server/v2/hooks/storage/badger"
-	"github.com/mochi-mqtt/server/v2/listeners"
-	"github.com/mochi-mqtt/server/v2/packets"
 	"log/slog"
 	authManager "wechat-hub/auth"
+
+	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/hooks/auth"
+	"github.com/mochi-mqtt/server/v2/listeners"
+	"github.com/mochi-mqtt/server/v2/packets"
 )
 
 type MQTTRedirector struct {
@@ -52,12 +52,12 @@ func NewMQTTServerMessageHandler(dataDir string, publishTopic string, options ..
 	server := mqtt.New(&mqtt.Options{
 		InlineClient: true, // 开启内联客户端
 	})
-	// 消息持久化
-	if err := server.AddHook(new(badger.Hook), &badger.Options{
-		Path: dataDir,
-	}); err != nil {
-		panic(err)
-	}
+	// // 消息持久化
+	// if err := server.AddHook(new(badger.Hook), &badger.Options{
+	// 	Path: dataDir,
+	// }); err != nil {
+	// 	panic(err)
+	// }
 	h := &MQTTRedirector{
 		server:       server,
 		publishTopic: publishTopic,

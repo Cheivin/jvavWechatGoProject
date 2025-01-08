@@ -3,12 +3,13 @@ package redirect
 import (
 	"context"
 	"fmt"
-	"github.com/eatmoreapple/openwechat"
-	"github.com/gorilla/websocket"
 	"log/slog"
 	"net/http"
 	"time"
 	"wechat-hub/auth"
+
+	"github.com/eatmoreapple/openwechat"
+	"github.com/gorilla/websocket"
 )
 
 type WSServerRedirector struct {
@@ -103,14 +104,27 @@ func (h *WSServerRedirector) Register(dispatcher *openwechat.MessageMatchDispatc
 }
 
 func (h *WSServerRedirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	username := r.URL.Query().Get("username")
+	currentUser := r.RemoteAddr
 	if h.auth != nil {
-		password := r.URL.Query().Get("password")
-		if !h.auth.CheckUser(username, password) {
-			slog.Error("WebsocketServerMessageHandler Auth 用户名或密码错误")
-			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-			return
+		// header basic-auth认证
+		username, password, ok := r.BasicAuth()
+		if ok {
+			if !h.auth.CheckUser(username, password) {
+				slog.Error("WebsocketServerMessageHandler Auth 用户名或密码错误", "username", username, "password", password)
+				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
+		} else {
+			// query 认证
+			username = r.URL.Query().Get("username")
+			password = r.URL.Query().Get("password")
+			if !h.auth.CheckUser(username, password) {
+				slog.Error("WebsocketServerMessageHandler Auth 用户名或密码错误", "username", username, "password", password)
+				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
 		}
+		currentUser = username
 	}
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -120,7 +134,7 @@ func (h *WSServerRedirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.register <- newClient(conn, h.heartbeat, func(messageType int, message []byte) {
 		if h.onMessage != nil {
-			_ = h.onMessage(message, "WS_SERVER", username)
+			_ = h.onMessage(message, "WS_SERVER", currentUser)
 		}
 	})
 }

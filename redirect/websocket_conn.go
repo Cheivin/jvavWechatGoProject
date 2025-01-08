@@ -3,9 +3,10 @@ package redirect
 import (
 	"context"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"log/slog"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type wsConnection interface {
@@ -98,8 +99,10 @@ func (c *connection) readMessage() {
 				c.exit <- err
 				return
 			}
-		default:
+		case websocket.TextMessage, websocket.BinaryMessage:
 			c.onReceiveMessage(messageType, message)
+		default:
+			// 其他消息忽略
 		}
 	}
 }
